@@ -1,0 +1,285 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Xtreme Anything</title>
+<style>
+  * { box-sizing: border-box; }
+  body { margin: 0; font-family: system-ui, sans-serif; color: #222; background: #f4f4f5; }
+  main { display: grid; grid-template-columns: minmax(320px, 480px) 1fr; gap: 24px; padding: 24px; min-height: 100vh; }
+  @media (max-width: 800px) { main { grid-template-columns: 1fr; } }
+  section { background: #fff; border-radius: 10px; padding: 20px; box-shadow: 0 1px 3px rgba(0,0,0,.08); }
+  h1 { font-size: 20px; margin: 0 0 16px; }
+  label.field { display: block; font-size: 13px; color: #555; margin-bottom: 12px; }
+  input[type=text] { width: 100%; padding: 7px 9px; border: 1px solid #ccc; border-radius: 6px; font: inherit; font-size: 14px; }
+  input[type=text]:disabled { background: #f3f3f3; }
+  .head, .row { display: grid; grid-template-columns: 1fr 120px 26px 26px 26px; gap: 6px; align-items: center; margin-bottom: 6px; }
+  .head { font-size: 12px; color: #777; }
+  button { font: inherit; font-size: 14px; border: 1px solid #ccc; background: #fafafa; border-radius: 6px; padding: 6px 10px; cursor: pointer; }
+  button:hover { background: #eee; }
+  .row button { padding: 4px 0; }
+  .actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 12px; }
+  .hint { font-size: 12px; color: #777; margin-top: 14px; line-height: 1.4; }
+  #preview { display: flex; flex-direction: column; }
+  #canvas { flex: 1; display: flex; align-items: center; justify-content: center; overflow: auto; }
+  #canvas svg { max-width: 100%; max-height: calc(100vh - 140px); height: auto; }
+</style>
+</head>
+<body>
+<main>
+  <section>
+    <h1>Xtreme Anything</h1>
+    <label class="field">Title (optional)
+      <input type="text" id="title">
+    </label>
+    <div class="head"><span>Up-label</span><span>Down-label</span></div>
+    <div id="rows"></div>
+    <div class="actions">
+      <button id="add">+ Add label</button>
+      <label style="display:flex;align-items:center;gap:6px;font-size:14px">
+        <input type="checkbox" id="showDownLabels"> Show down-labels
+      </label>
+    </div>
+    <div class="actions">
+      <button id="svgBtn">Download SVG</button>
+      <button id="pngBtn">Download PNG</button>
+      <button id="copyLink">Copy link</button>
+      <button id="reset">Reset to XP example</button>
+    </div>
+    <p class="hint">Up-labels are listed from the outermost loop to the innermost, up to 20. A loop runs back up from the last
+      up-label to every other one. A down-label sits beside the arrow from its up-label down to the next one, so the last
+      up-label has none.</p>
+  </section>
+  <section id="preview">
+    <div id="canvas"></div>
+  </section>
+</main>
+
+<script>
+const EXAMPLE = {
+  title: 'Planning/feedback loops',
+  showDownLabels: true,
+  items: [
+    { label: 'Release plan', down: 'Months' },
+    { label: 'Iteration plan', down: 'Weeks' },
+    { label: 'Acceptance test', down: 'Days' },
+    { label: 'Stand-up meeting', down: 'One day' },
+    { label: 'Pair negotiation', down: 'Hours' },
+    { label: 'Unit test', down: 'Minutes' },
+    { label: 'Pair programming', down: 'Seconds' },
+    { label: 'Code', down: '' },
+  ],
+};
+const STORAGE_KEY = 'feedback-loop-diagram';
+const MAX_ITEMS = 20;
+// The URL hash holds the whole diagram so links can be shared: base64url of compact JSON
+// {t: title, s: 1 if down-labels show, i: [[up-label, down-label], ...]}.
+function encodeHash(st) {
+  const json = JSON.stringify({ t: st.title, s: st.showDownLabels ? 1 : 0, i: st.items.map(it => [it.label, it.down]) });
+  const bin = String.fromCharCode(...new TextEncoder().encode(json));
+  return btoa(bin).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+}
+function decodeHash(hash) {
+  try {
+    const bin = atob(hash.replace(/-/g, '+').replace(/_/g, '/'));
+    const d = JSON.parse(new TextDecoder().decode(Uint8Array.from(bin, c => c.charCodeAt(0))));
+    // Links from a short-lived version carried [label, unused, down-label].
+    return { title: String(d.t ?? ''), showDownLabels: !!d.s, items: d.i.map(a => ({ label: String(a[0] ?? ''), down: String((a.length > 2 ? a[2] : a[1]) ?? '') })) };
+  } catch { return null; }
+}
+function loadState() {
+  const st = decodeHash(location.hash.slice(1)) || JSON.parse(localStorage.getItem(STORAGE_KEY) || 'null') || structuredClone(EXAMPLE);
+  // Earlier versions saved a single "time" label per row, shown where the down-label goes now.
+  st.showDownLabels ??= st.showSubLabels ?? st.showTimes ?? true;
+  st.items = st.items.slice(0, MAX_ITEMS).map(it => ({ label: it.label, down: it.down ?? it.time ?? '' }));
+  return st;
+}
+let state = loadState();
+
+const FONT = '"Times New Roman", Times, serif';
+const FS = 20, SUB_FS = 12.5, TITLE_FS = 26;
+const measureCtx = document.createElement('canvas').getContext('2d');
+function textWidth(text, size) {
+  measureCtx.font = `${size}px ${FONT}`;
+  return measureCtx.measureText(text).width;
+}
+const esc = s => s.replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+const f = n => +n.toFixed(2);
+
+function buildSvg() {
+  const items = state.items.map(it => ({ ...it, w: textWidth(it.label, FS) }));
+  const n = items.length;
+  const parts = [];
+  const thick = 4.5, thin = 2.5;
+  const big = { len: 14, half: 7 }, small = { len: 11, half: 5 };
+
+  // Circle radius: enough vertical room between labels, and room for the end labels.
+  const maxEndHalf = Math.max(items[0]?.w || 0, items[n - 1]?.w || 0) / 2;
+  const R = Math.max(6 * FS, 1.9 * FS * (n - 1), maxEndHalf + 3 * FS);
+  const cx = 0, cy = 0;
+
+  // Labels sit on the right half of the circle, top to bottom. Their spacing blends
+  // even angles with even heights so the ends don't crowd together.
+  const alpha = 0.28;
+  items.forEach((it, i) => {
+    const t = n === 1 ? 0.5 : i / (n - 1);
+    const u = alpha * Math.sin(Math.PI * (t - 0.5)) + (1 - alpha) * (2 * t - 1);
+    it.y = cy + R * u;
+    it.x = cx + R * Math.sqrt(Math.max(0, 1 - u * u));
+    if (i === 0 || i === n - 1) it.x = cx;
+  });
+
+  // Short arrows along the circle from each label to the next.
+  const angle = y => Math.asin(Math.max(-1, Math.min(1, (y - cy) / R)));
+  const pt = th => [cx + R * Math.cos(th), cy + R * Math.sin(th)];
+  for (let i = 0; i < n - 1; i++) {
+    const a0 = angle(items[i].y + 0.55 * FS);
+    const a1 = angle(items[i + 1].y - 0.75 * FS) - big.len / R;
+    if (a1 <= a0) continue;
+    const [x0, y0] = pt(a0), [x1, y1] = pt(a1);
+    parts.push(`<path d="M${f(x0)},${f(y0)} A${f(R)},${f(R)} 0 0 1 ${f(x1)},${f(y1)}" fill="none" stroke="#000" stroke-width="${thick}" stroke-linecap="round" marker-end="url(#big)"/>`);
+    const down = items[i].down.trim();
+    if (state.showDownLabels && down) {
+      // Right-align the text just left of wherever the arrow is across the text's height,
+      // since near the top and bottom the arrow slopes steeply sideways.
+      const ty = (pt(a0)[1] + pt(a1)[1]) / 2;
+      const arcX = y => cx + R * Math.cos(angle(y));
+      const tx = Math.min(arcX(ty - SUB_FS * 0.6), arcX(ty + SUB_FS * 0.6));
+      parts.push(`<text x="${f(tx - 8)}" y="${f(ty)}" font-size="${SUB_FS}" text-anchor="end" dominant-baseline="middle">${esc(down)}</text>`);
+    }
+  }
+
+  // Loops from the last label back to every earlier label, outermost first.
+  if (n > 1) {
+    const K = 0.5523; // cubic bezier approximation of a quarter ellipse
+    const sx = cx - items[n - 1].w / 2 - 8, sy = items[n - 1].y;
+    const a0 = sx - (cx - R), b0 = (sy - items[0].y) / 2;
+    for (let i = 0; i < n - 1; i++) {
+      const it = items[i];
+      const head = i === 0 ? big : small;
+      const ex = it.x - it.w / 2 - 6 - head.len, ey = it.y;
+      const b = (sy - ey) / 2, ly = sy - b;
+      const lx = sx - a0 * Math.pow(b / b0, 0.6);
+      const d = `M${f(sx)},${f(sy)}`
+        + ` C${f(sx - K * (sx - lx))},${f(sy)} ${f(lx)},${f(ly + K * b)} ${f(lx)},${f(ly)}`
+        + ` C${f(lx)},${f(ly - K * b)} ${f(ex - K * (ex - lx))},${f(ey)} ${f(ex)},${f(ey)}`;
+      parts.push(`<path d="${d}" fill="none" stroke="#000" stroke-width="${i === 0 ? thick : thin}" stroke-linecap="round" marker-end="url(#${i === 0 ? 'big' : 'small'})"/>`);
+    }
+  }
+
+  items.forEach(it => parts.push(`<text x="${f(it.x)}" y="${f(it.y)}" font-size="${FS}" text-anchor="middle" dominant-baseline="middle">${esc(it.label)}</text>`));
+
+  // Title above the diagram, left of center like the original.
+  const title = state.title.trim();
+  if (title) parts.push(`<text x="${f(cx - R * 0.55)}" y="${f(cy - R - 1.6 * FS)}" font-size="${TITLE_FS}">${esc(title)}</text>`);
+
+  // Arrowheads are drawn beyond the end of their path so the thick stroke never pokes through the tip.
+  const marker = (id, h) => `<marker id="${id}" markerUnits="userSpaceOnUse" markerWidth="${h.len}" markerHeight="${2 * h.half}" refX="0" refY="${h.half}" orient="auto" overflow="visible"><path d="M0,0 L${h.len},${h.half} L0,${2 * h.half} z"/></marker>`;
+  return `<svg xmlns="http://www.w3.org/2000/svg" font-family='${FONT}'><defs>${marker('big', big)}${marker('small', small)}</defs><g id="content">${parts.join('')}</g></svg>`;
+}
+
+function render() {
+  localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
+  history.replaceState(null, '', '#' + encodeHash(state));
+  const canvas = document.getElementById('canvas');
+  canvas.innerHTML = buildSvg();
+  const svg = canvas.querySelector('svg');
+  const box = svg.getElementById('content').getBBox();
+  const pad = 16;
+  const w = box.width + 2 * pad, h = box.height + 2 * pad;
+  svg.setAttribute('viewBox', `${f(box.x - pad)} ${f(box.y - pad)} ${f(w)} ${f(h)}`);
+  svg.setAttribute('width', f(w));
+  svg.setAttribute('height', f(h));
+  svg.insertAdjacentHTML('afterbegin', `<rect x="${f(box.x - pad)}" y="${f(box.y - pad)}" width="${f(w)}" height="${f(h)}" fill="#fff"/>`);
+}
+
+function renderRows() {
+  const rows = document.getElementById('rows');
+  rows.innerHTML = '';
+  state.items.forEach((it, i) => {
+    const last = i === state.items.length - 1;
+    const row = document.createElement('div');
+    row.className = 'row';
+    row.innerHTML = `
+      <input type="text" class="label" placeholder="Up-label">
+      <input type="text" class="down" placeholder="${last ? '—' : 'optional'}" ${last ? 'disabled title="The last label has no arrow down"' : ''}>
+      <button class="moveUp" title="Move up">↑</button>
+      <button class="moveDown" title="Move down">↓</button>
+      <button class="del" title="Remove">✕</button>`;
+    row.querySelector('.label').value = it.label;
+    row.querySelector('.down').value = it.down;
+    row.querySelector('.label').oninput = e => { it.label = e.target.value; render(); };
+    row.querySelector('.down').oninput = e => { it.down = e.target.value; render(); };
+    const move = d => {
+      const j = i + d;
+      if (j < 0 || j >= state.items.length) return;
+      [state.items[i], state.items[j]] = [state.items[j], state.items[i]];
+      update();
+    };
+    row.querySelector('.moveUp').onclick = () => move(-1);
+    row.querySelector('.moveDown').onclick = () => move(1);
+    row.querySelector('.del').onclick = () => { state.items.splice(i, 1); update(); };
+    rows.appendChild(row);
+  });
+}
+
+function update() {
+  document.getElementById('title').value = state.title;
+  document.getElementById('showDownLabels').checked = state.showDownLabels;
+  document.getElementById('add').disabled = state.items.length >= MAX_ITEMS;
+  renderRows();
+  render();
+}
+
+function svgSource() {
+  return '<?xml version="1.0" encoding="UTF-8"?>\n' + new XMLSerializer().serializeToString(document.querySelector('#canvas svg'));
+}
+function download(href, name) {
+  const a = document.createElement('a');
+  a.href = href; a.download = name; a.click();
+}
+
+document.getElementById('title').oninput = e => { state.title = e.target.value; render(); };
+document.getElementById('showDownLabels').onchange = e => { state.showDownLabels = e.target.checked; render(); };
+document.getElementById('add').onclick = () => {
+  if (state.items.length >= MAX_ITEMS) return;
+  // New labels go just before the last one, which is the loops' shared starting point.
+  state.items.splice(Math.max(0, state.items.length - 1), 0, { label: 'New label', down: '' });
+  update();
+  const inputs = document.querySelectorAll('#rows .label');
+  inputs[Math.max(0, inputs.length - 2)].select();
+};
+document.getElementById('reset').onclick = () => { state = structuredClone(EXAMPLE); update(); };
+document.getElementById('copyLink').onclick = async e => {
+  await navigator.clipboard.writeText(location.href);
+  e.target.textContent = 'Copied!';
+  setTimeout(() => { e.target.textContent = 'Copy link'; }, 1500);
+};
+// Pasting a different shared link into this tab's address bar only changes the hash.
+addEventListener('hashchange', () => {
+  if (location.hash.slice(1) !== encodeHash(state)) { state = loadState(); update(); }
+});
+document.getElementById('svgBtn').onclick = () => {
+  const url = URL.createObjectURL(new Blob([svgSource()], { type: 'image/svg+xml' }));
+  download(url, 'diagram.svg');
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
+};
+document.getElementById('pngBtn').onclick = () => {
+  const svg = document.querySelector('#canvas svg');
+  const scale = 3;
+  const img = new Image();
+  img.onload = () => {
+    const c = document.createElement('canvas');
+    c.width = svg.width.baseVal.value * scale;
+    c.height = svg.height.baseVal.value * scale;
+    c.getContext('2d').drawImage(img, 0, 0, c.width, c.height);
+    download(c.toDataURL('image/png'), 'diagram.png');
+  };
+  img.src = 'data:image/svg+xml;charset=utf-8,' + encodeURIComponent(svgSource());
+};
+
+update();
+</script>
+</body>
+</html>
